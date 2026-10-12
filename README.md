@@ -36,7 +36,7 @@ AI_Prompt/
 | --- | --- | --- | --- |
 | [`01-citrus-jelly`](./01-citrus-jelly) | 잡고 늘리고 놓을 수 있는 반달 모양 오렌지 젤리. 브라우저에서 실시간으로 계산되는 말랑한 물체 | Claude Opus 5.5 (`claude-opus-5-5`) | 2026-10-12 |
 | [`02-tidepool-jelly`](./02-tidepool-jelly) | 모든 것이 젤리로 된 작은 해안 디오라마. 밀물·썰물, 잔물결, 웅덩이 속 젤리 생물 7종 | Claude Opus 5.5 (`claude-opus-5-5`) | 2026-10-12 |
-| [`03-fashion-contact-sheet`](./03-fashion-contact-sheet) | 인물 사진 한 장으로 만든 9컷 패션 컨택트 시트 | GPT 이미지 생성 (Codex CLI 내장 도구, 모델 ID 미보고) · 진행 Claude Opus 5.5 | 2026-10-12 |
+| [`03-fashion-contact-sheet`](./03-fashion-contact-sheet) | 인물 사진 한 장으로 만든 9컷 패션 컨택트 시트 (한 번에 생성한 판 / 9컷을 따로 생성해 합성한 판) | GPT 이미지 생성 (Codex CLI 내장 도구, 모델 ID 미보고) · 진행 Claude Opus 5.5 | 2026-10-12 |
 
 ### Citrus Jelly 쉽게 설명하면
 
@@ -109,10 +109,11 @@ AI_Prompt/
 **어떻게 만들었나요?**
 - OpenAI의 GPT 이미지 생성을 Codex CLI의 내장 도구로 호출했습니다. Claude Code가 프롬프트 전달, 결과 점검, 기록을 맡았습니다.
 - 원문 그대로 넣은 첫 시도는 OpenAI 안전 시스템에서 차단됐고, 하의를 반바지에서 청바지로 바꾼 두 번째 시도가 성공했습니다. 바꾼 문장과 조건별로 맞은 것·다른 것은 `prompt.md`에 정리했습니다.
+- 같은 프롬프트를 **9컷으로 나눠 한 장씩 생성하고, 그리드·테두리·라벨은 코드(`compose.py`)로 합친 판**도 만들었습니다. 패널 비율과 라벨 철자가 정확해지는 대신 생성을 9번 써야 하고, "프롬프트 한 번으로 나온 결과"는 아니게 됩니다. 두 판의 차이는 `prompt.md`의 비교표에 있습니다.
 - 참조 사진은 개인 사진이라 저장소에 올리지 않았습니다.
 
 **어떻게 보나요?**
-`contact-sheet.png`를 열면 됩니다(GitHub에서도 바로 보입니다).
+한 번에 생성한 판은 `contact-sheet.png`, 9컷을 합성한 판은 `contact-sheet-9shot.png`입니다. 컷별 원본은 `panels/` 폴더에 있습니다(GitHub에서도 바로 보입니다).
 
 ## 새 항목 추가하는 방법
 
