@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
-<title>Citrus Jelly — Material Studies No. 010</title>
+<title>Citrus Jelly</title>
 <style>
   :root {
     --paper: #e9e5de;
@@ -31,8 +31,6 @@
     top: calc(env(safe-area-inset-top) + 22px); left: calc(env(safe-area-inset-left) + 26px);
     max-width: calc(100vw - 52px);
   }
-  .corner { margin: 0 0 30px; font: 600 10.5px/1 var(--sans); letter-spacing: .17em; text-transform: uppercase; }
-  .corner i { font-style: normal; opacity: .4; padding: 0 .35em; }
   .title {
     margin: 0; font: 400 clamp(54px, 8.4vw, 136px)/.86 var(--serif); letter-spacing: -.028em;
   }
@@ -98,14 +96,12 @@
     background: var(--paper);
   }
   #fallback[hidden] { display: none; }
-  #fallback .corner { position: fixed; top: calc(env(safe-area-inset-top) + 22px); left: 26px; }
   #fallback h2 { margin: 0 0 16px; font: 400 clamp(34px, 6.4vw, 78px)/1 var(--serif); letter-spacing: -.02em; }
   #fallback p { margin: 0; max-width: 40ch; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
   body.no-gpu .panel, body.no-gpu .mast { display: none; }
 
   @media (max-width: 640px) {
     .mast { top: calc(env(safe-area-inset-top) + 16px); left: calc(env(safe-area-inset-left) + 18px); }
-    .corner { margin-bottom: 14px; font-size: 9.5px; }
     .title { font-size: clamp(42px, 13.5vw, 68px); }
     .hint { margin-top: 8px; font-size: 14px; }
     .panel {
@@ -120,7 +116,6 @@
     .keys { display: none; }
   }
   @media (max-height: 560px) and (min-width: 641px) {
-    .corner { margin-bottom: 14px; }
     .title { font-size: clamp(40px, 7vw, 76px); }
   }
 </style>
@@ -129,7 +124,6 @@
 <canvas id="view" aria-label="Interactive jelly slice shaped like a half-moon citrus wedge. Drag it to stretch it." role="img"></canvas>
 
 <header class="mast">
-  <p class="corner">Material Studies<i>/</i>No. 010</p>
   <h1 class="title">Citrus /<br><em>Jelly.</em></h1>
   <p class="hint">Grab. Stretch. Let go.</p>
 </header>
@@ -157,7 +151,6 @@
 </section>
 
 <div id="fallback" hidden>
-  <p class="corner">Material Studies<i>/</i>No. 010</p>
   <div>
     <h2>This slice needs WebGPU.</h2>
     <p>Your browser didn’t expose a WebGPU device. Try a current Chrome, Edge or Safari with WebGPU turned on.</p>

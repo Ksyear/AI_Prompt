@@ -1,4 +1,4 @@
-# Citrus / Jelly — Material Studies No. 010
+# 01 · Citrus Jelly
 
 | 항목 | 내용 |
 | --- | --- |
@@ -57,5 +57,6 @@
 ## 제작 메모
 
 - 물리(XPBD)는 CPU(JavaScript)에서, 렌더링은 WebGPU/WGSL로 처리합니다.
+- 프롬프트의 모서리 라벨 "Material Studies / No. 010"은 처음엔 구현했으나, 이후 요청에 따라 화면과 페이지 제목에서 뺐습니다.
 - 초안 작성 후 헤드리스 Chrome(WebGPU)에서 실행하며 셰이더 컴파일, 메시 무결성, 안정성(넘어짐·반전 사면체 복구·NaN 재설정), 모바일 레이아웃, 폴백 화면을 확인하고 수정했습니다.
 - 회전 추출은 Müller et al. 2016 원 논문 부록 코드와, 톤 매핑은 [KhronosGroup/ToneMapping](https://github.com/KhronosGroup/ToneMapping) 원본과 대조했습니다.
