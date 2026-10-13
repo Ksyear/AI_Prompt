@@ -1,0 +1,1154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Hang. Launch Film</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Geist:wght@100..900&display=block">
+<style>
+  :root { --paper: #F2EEE6; --ink: #0D0D0D; }
+  html, body { margin: 0; background: #1a1a1a; }
+  body.preview { display: grid; place-items: center; min-height: 100vh; }
+  body.preview #frame { transform: scale(var(--fit, .5)); transform-origin: 50% 50%; }
+  #stage { position: relative; width: 1440px; height: 1440px; overflow: hidden; background: var(--paper); contain: strict; }
+  #stage * { box-sizing: border-box; }
+  .L { position: absolute; left: 0; top: 0; transform-origin: 0 0; visibility: inherit; }
+  .sec { position: absolute; left: 0; top: 0; width: 1440px; height: 1440px; visibility: hidden; }
+  .ph { position: absolute; left: 0; top: 0; display: block; object-fit: cover; transform-origin: 0 0; visibility: inherit; }
+  .geist { font-family: Geist, system-ui, sans-serif; }
+  .clip { overflow: hidden; }
+  svg.L { overflow: visible; }
+  #scrub { position: fixed; left: 16px; right: 16px; bottom: 12px; display: none; }
+  body.preview #scrub { display: block; }
+</style>
+</head>
+<body>
+<div id="frame"><div id="stage"></div></div>
+<input id="scrub" type="range" min="0" max="27" step="0.0083" value="0">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs id="defs"></defs></svg>
+<script>
+'use strict';
+// ───────────────────────── time ─────────────────────────
+const W = 1440, C = W / 2;
+const BPM = 120, BEAT = 60 / BPM, NBEATS = 54, DUR = NBEATS * BEAT;   // 27 s
+const b = n => (n - 1) * BEAT;                                         // start of beat n (1-indexed)
+const clamp = (x, a = 0, z = 1) => Math.min(z, Math.max(a, x));
+const lerp = (a, z, k) => a + (z - a) * k;
+const PAPER = '#F2EEE6', INK = '#0D0D0D';
+
+// Closed-form step response of a damped spring (0 → 1). Pure in tau.
+function spring(tau, f = 3, z = 0.75) {
+  if (tau <= 0) return 0;
+  const w = 2 * Math.PI * f;
+  if (z >= 1) return 1 - Math.exp(-w * tau) * (1 + w * tau);
+  const wd = w * Math.sqrt(1 - z * z);
+  return 1 - Math.exp(-z * w * tau) * (Math.cos(wd * tau) + (z * w / wd) * Math.sin(wd * tau));
+}
+// A value with several targets: base + one spring per change. keys: [[t, v, f?, z?], ...]
+function track(t, keys, f = 3, z = 0.75) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) {
+    const [ti, vi, fi = f, zi = z] = keys[i];
+    v += (vi - keys[i - 1][1]) * spring(t - ti, fi, zi);
+  }
+  return v;
+}
+const trackN = (t, keys, n, f, z) => Array.from({ length: n }, (_, i) => track(t, keys.map(k => [k[0], k[1][i], k[2], k[3]]), f, z));
+const track2 = (t, keys, f, z) => trackN(t, keys, 2, f, z);
+const rectTrack = (t, keys, f, z) => trackN(t, keys, 4, f, z);
+// one spring that rises at a and falls back at z (a pulse), e.g. a press
+const pulse = (t, a, d = 0.12, f = 6, z = 0.6) => spring(t - a, f, z) - spring(t - a - d, f, z);
+// text that rises from its mask line at `a` and leaves upward at `z`
+const riseY = (t, a, z, h, f = 3.4, d = 0.78) => (1 - spring(t - a, f, d)) * h - (z == null ? 0 : spring(t - z, f, d) * h);
+
+// ───────────────────────── dom helpers ─────────────────────────
+const stage = document.getElementById('stage');
+const defs = document.getElementById('defs');
+const SVGNS = 'http://www.w3.org/2000/svg';
+function el(tag, cls, parent, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  (parent || stage).appendChild(e);
+  return e;
+}
+function sel(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const css = (e, o) => { for (const k in o) e.style[k] = o[k]; return e; };
+// 'inherit', never 'visible': a visible child shows through a hidden parent
+const show = (e, on) => { e.style.visibility = on ? 'inherit' : 'hidden'; };
+function box(e, x, y, w, h, extra) {
+  e.style.transform = `translate(${x}px, ${y}px)`;
+  e.style.width = `${Math.max(0, w)}px`;
+  e.style.height = `${Math.max(0, h)}px`;
+  if (extra) css(e, extra);
+}
+const px = v => `${v}px`;
+function text(parent, s, o) { const e = el('div', 'L geist', parent, s); css(e, Object.assign({ whiteSpace: 'pre', lineHeight: '1', color: INK }, o)); return e; }
+const widthOf = e => e.getBoundingClientRect().width;
+
+// images and filter maps that must be decoded before a frame is captured
+let pending = [];
+function preload(url) { const im = new Image(); im.src = url; pending.push(im.decode().catch(() => {})); }
+const twoFrames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+// ───────────────────────── assets ─────────────────────────
+const PHOTO = {
+  lemons: 'assets/photos/01-lemons.png', dropDay: 'assets/photos/02-droplet-day.png',
+  dropGold: 'assets/photos/03-droplet-golden.png', sea: 'assets/photos/04-seascape.png',
+  facade: 'assets/photos/05-facade.png', palm: 'assets/photos/06-palm-shadow.png',
+  poppies: 'assets/photos/07-poppies.png', cat: 'assets/photos/08-cat.png',
+  pool: 'assets/photos/09-pool.png', oranges: 'assets/photos/10-oranges.png',
+  dunes: 'assets/photos/11-dunes.png', umbrellas: 'assets/photos/12-umbrellas.png',
+};
+const DROP = { x: 620 / 1254, y: 615 / 1254 };    // droplet centre in the generated photo (measured)
+const WALL_SRC = 'assets/wall/wall-1440-60p-intra.mp4';   // 30 fps footage motion-interpolated to 60
+const imgs = [];
+function photo(key, parent, cls = 'ph') {
+  const i = el('img', cls, parent);
+  i.src = PHOTO[key]; i.decoding = 'sync'; i.draggable = false;
+  imgs.push(i);
+  return i;
+}
+
+// ───────────────────────── liquid glass ─────────────────────────
+function canvasURL(w, h, fill) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const g = cv.getContext('2d'), im = g.createImageData(w, h);
+  fill(im.data, w, h);
+  g.putImageData(im, 0, 0);
+  return cv.toDataURL();
+}
+// Displacement map from a rounded-rect distance field: the rim bends the backdrop outward, the centre stays flat.
+const mapCache = new Map();
+function rrectMap(w, h, r, bezel) {
+  const key = `${w}|${h}|${r}|${bezel}`;
+  if (mapCache.has(key)) return mapCache.get(key);
+  const url = canvasURL(w, h, d => {
+    const hx = w / 2 - r, hy = h / 2 - r;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const px_ = x + 0.5 - w / 2, py_ = y + 0.5 - h / 2;
+      const qx = Math.abs(px_) - hx, qy = Math.abs(py_) - hy;
+      const sd = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
+      let nx, ny;
+      if (qx > 0 && qy > 0) { const l = Math.hypot(qx, qy) || 1; nx = qx / l; ny = qy / l; }
+      else if (qx > qy) { nx = 1; ny = 0; } else { nx = 0; ny = 1; }
+      nx *= Math.sign(px_) || 1; ny *= Math.sign(py_) || 1;
+      const e = -sd;
+      let k = 0;
+      if (e <= 0) k = 1; else if (e < bezel) { const u = 1 - e / bezel; k = u * u * (1.6 - 0.6 * u); }
+      const i = (y * w + x) * 4;
+      d[i] = 128 + 127 * nx * k; d[i + 1] = 128 + 127 * ny * k; d[i + 2] = 128; d[i + 3] = 255;
+    }
+  });
+  mapCache.set(key, url);
+  return url;
+}
+let CIRCLE_MAP = '';
+let filterSeq = 0;
+const CHROMA = [1, 1.07, 1.14];   // R, G, B displacement strengths: coloured edges
+// SVG filter: the map sits on a neutral flood, three displacements recombined per channel
+function glassFilter() {
+  const id = `glass${filterSeq++}`;
+  const f = sel('filter', { id, x: 0, y: 0, width: 10, height: 10, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' }, defs);
+  sel('feFlood', { 'flood-color': 'rgb(128,128,128)', result: 'neutral' }, f);
+  const img = sel('feImage', { preserveAspectRatio: 'none', result: 'img' }, f);
+  const merge = sel('feMerge', { result: 'map' }, f);
+  sel('feMergeNode', { in: 'neutral' }, merge); sel('feMergeNode', { in: 'img' }, merge);
+  const disp = CHROMA.map((_, i) => sel('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: 0, xChannelSelector: 'R', yChannelSelector: 'G', result: `d${i}` }, f));
+  ['1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0', '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0', '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0']
+    .forEach((v, i) => sel('feColorMatrix', { in: `d${i}`, type: 'matrix', values: v, result: `c${i}` }, f));
+  sel('feComposite', { in: 'c0', in2: 'c1', operator: 'arithmetic', k2: 1, k3: 1, result: 'rg' }, f);
+  sel('feComposite', { in: 'rg', in2: 'c2', operator: 'arithmetic', k2: 1, k3: 1 }, f);
+  let lastUrl = '', lastGeom = '', lastScale = -1;
+  return {
+    id,
+    set(url, cw, ch, ix, iy, iw, ih, scale) {
+      const geom = [cw, ch, ix, iy, iw, ih].map(v => v.toFixed(2)).join('|');
+      if (geom !== lastGeom) {
+        f.setAttribute('width', cw); f.setAttribute('height', ch);
+        img.setAttribute('x', ix); img.setAttribute('y', iy); img.setAttribute('width', iw); img.setAttribute('height', ih);
+        lastGeom = geom;
+      }
+      if (url !== lastUrl) { img.setAttribute('href', url); preload(url); lastUrl = url; }
+      if (scale !== lastScale) { disp.forEach((d, i) => d.setAttribute('scale', (scale * CHROMA[i]).toFixed(2))); lastScale = scale; }
+    },
+  };
+}
+// A glass panel: clip box + filtered copy of the backdrop + rim light + content.
+const GM = 64;   // copy margin so the rim can sample beyond the panel
+function glassPanel(parent) {
+  const outer = el('div', 'L clip', parent);
+  const clone = el('div', 'L', outer);
+  const rim = el('div', 'L', outer);
+  const ui = el('div', 'L', outer);
+  const filt = glassFilter();
+  clone.style.filter = `url(#${filt.id})`;
+  return { outer, clone, rim, ui, filt, store: {} };
+}
+const RIM = 'inset 0 0 0 1.5px rgba(255,255,255,.55), inset 0 2px 1px rgba(255,255,255,.7), inset 0 -2px 3px rgba(0,0,0,.10), inset 3px 6px 14px rgba(255,255,255,.22), inset -4px -8px 16px rgba(0,0,0,.10)';
+function placeGlass(g, x, y, w, h, r, opt = {}) {
+  const { bezel = Math.min(w, h) * 0.46, scale = 104, circle = false, tint = 0.1 } = opt;
+  box(g.outer, x, y, w, h, { borderRadius: px(r) });
+  box(g.clone, -GM, -GM, w + 2 * GM, h + 2 * GM);
+  let url;
+  if (circle) url = CIRCLE_MAP;
+  else {
+    const q = v => Math.max(4, Math.round(v / 4) * 4);
+    const qw = q(w), qh = q(h);
+    url = rrectMap(qw, qh, Math.min(q(r), qw / 2, qh / 2), Math.max(2, Math.round(Math.min(bezel, qw / 2, qh / 2))));
+  }
+  g.filt.set(url, w + 2 * GM, h + 2 * GM, GM, GM, w, h, scale);
+  if (!circle) box(g.rim, 0, 0, w, h, { borderRadius: px(r), boxShadow: RIM,
+    background: `linear-gradient(180deg, rgba(255,255,255,${tint + 0.06}), rgba(255,255,255,${tint * 0.4}) 55%, rgba(255,255,255,${tint * 0.7}))` });
+  box(g.ui, 0, 0, w, h);
+  return { ox: x - GM, oy: y - GM };   // screen position of the copy's origin
+}
+
+// Glass letters: a canvas distance field per glyph gives the map, the mask and the highlight.
+function edt1d(f, n, d, v, z) {
+  let k = 0; v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+    k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
+}
+function insideDistance(alpha, w, h) {
+  const g = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = alpha[i] > 127 ? 1e20 : 0;
+  const n = Math.max(w, h), f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) f[y] = g[y * w + x]; edt1d(f, h, d, v, z); for (let y = 0; y < h; y++) g[y * w + x] = d[y]; }
+  for (let y = 0; y < h; y++) { for (let x = 0; x < w; x++) f[x] = g[y * w + x]; edt1d(f, w, d, v, z); for (let x = 0; x < w; x++) g[y * w + x] = Math.sqrt(d[x]); }
+  return g;
+}
+function glassGlyph(ch, size, stretch) {
+  const M = 48, font = `800 ${stretch} ${size}px Archivo`;
+  const cv = document.createElement('canvas'), g = cv.getContext('2d');
+  g.font = font;
+  const m = g.measureText(ch);
+  const L = Math.ceil(m.actualBoundingBoxLeft), R = Math.ceil(m.actualBoundingBoxRight);
+  const A = Math.ceil(m.actualBoundingBoxAscent), D = Math.ceil(m.actualBoundingBoxDescent);
+  const w = L + R + 2 * M, h = A + D + 2 * M;
+  cv.width = w; cv.height = h;
+  g.font = font; g.fillStyle = '#fff';
+  g.fillText(ch, M + L, M + A);
+  const src = g.getImageData(0, 0, w, h).data;
+  const alpha = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) alpha[i] = src[i * 4 + 3];
+  const dist = insideDistance(alpha, w, h);
+  // rounded bevel height field, slightly smoothed
+  const B = size * 0.09;
+  let hf = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) { const u = Math.min(dist[i], B) / B; hf[i] = B * Math.sqrt(Math.max(0, 1 - (1 - u) * (1 - u))); }
+  // separable box blur (three passes ≈ gaussian) rounds off the creases of the distance field
+  const BR = Math.max(2, Math.round(size * 0.012));
+  for (let pass = 0; pass < 3; pass++) {
+    for (const [stepA, stepB, nA, nB] of [[1, w, w, h], [w, 1, h, w]]) {
+      const o = new Float32Array(w * h);
+      for (let j = 0; j < nB; j++) {
+        let s = 0;
+        const at = i => hf[j * stepB + clamp(i, 0, nA - 1) * stepA];
+        for (let i = -BR; i <= BR; i++) s += at(i);
+        for (let i = 0; i < nA; i++) { o[j * stepB + i * stepA] = s / (2 * BR + 1); s += at(i + BR + 1) - at(i - BR); }
+      }
+      hf = o;
+    }
+  }
+  for (let i = 0; i < w * h; i++) if (alpha[i] === 0) hf[i] = 0;
+  const Lx = -0.45, Ly = -0.8, Lz = 0.55, Ll = Math.hypot(Lx, Ly, Lz);
+  const Hx = Lx / Ll, Hy = Ly / Ll, Hz = Lz / Ll + 1, Hl = Math.hypot(Hx, Hy, Hz);
+  const normals = new Float32Array(w * h * 3);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    const gx = (hf[i + 1] - hf[i - 1]) / 2, gy = (hf[i + w] - hf[i - w]) / 2;
+    const l = Math.hypot(gx, gy, 1);
+    normals[i * 3] = -gx / l; normals[i * 3 + 1] = -gy / l; normals[i * 3 + 2] = 1 / l;
+  }
+  const map = canvasURL(w, h, d => {
+    for (let i = 0; i < w * h; i++) {
+      d[i * 4] = 128 + 127 * clamp(normals[i * 3] * 1.25, -1, 1);
+      d[i * 4 + 1] = 128 + 127 * clamp(normals[i * 3 + 1] * 1.25, -1, 1);
+      d[i * 4 + 2] = 128; d[i * 4 + 3] = 255;
+    }
+  });
+  const mask = canvasURL(w, h, d => { for (let i = 0; i < w * h; i++) { d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255; d[i * 4 + 3] = alpha[i]; } });
+  const hi = canvasURL(w, h, d => {
+    for (let i = 0; i < w * h; i++) {
+      const nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2] || 1;
+      const edge = 1 - nz, side = (nx * Lx + ny * Ly) / Math.hypot(Lx, Ly);
+      const spec = Math.pow(Math.max(0, (nx * Hx + ny * Hy + nz * Hz) / Hl), 70);
+      const a = alpha[i] / 255;
+      const rimLine = dist[i] < 2.2 ? 0.55 : 0;   // a thin lit edge so the letter reads on busy photos
+      const white = clamp(0.1 + rimLine + 2.0 * edge * Math.max(side, 0) + 1.1 * spec) * a;
+      const black = clamp(1.0 * edge * Math.max(-side, 0)) * a;
+      const j = i * 4;
+      if (white >= black) { d[j] = d[j + 1] = d[j + 2] = 255; d[j + 3] = 255 * white; }
+      else { d[j] = d[j + 1] = d[j + 2] = 0; d[j + 3] = 255 * black; }
+    }
+  });
+  return { ch, w, h, adv: m.width, ox: M + L, oy: M + A, map, mask, hi };
+}
+function glassLetters(parent, word, size, stretch, scale, tracking = 0) {
+  const out = [];
+  let pen = 0;
+  for (const ch of word) {
+    const gl = glassGlyph(ch, size, stretch);
+    const wrap = el('div', 'L', parent);
+    const body = el('div', 'L', wrap);
+    const clone = el('div', 'L', body);
+    const mask = `url(${gl.mask})`;
+    css(clone, { width: px(gl.w), height: px(gl.h), WebkitMaskImage: mask, maskImage: mask, WebkitMaskSize: '100% 100%', maskSize: '100% 100%', WebkitMaskRepeat: 'no-repeat', maskRepeat: 'no-repeat' });
+    const filt = glassFilter();
+    filt.set(gl.map, gl.w, gl.h, 0, 0, gl.w, gl.h, scale);
+    clone.style.filter = `url(#${filt.id})`;
+    const hi = el('img', 'L', body); hi.src = gl.hi; css(hi, { width: px(gl.w), height: px(gl.h) });
+    css(wrap, { width: px(gl.w), height: px(gl.h) });
+    out.push({ gl, wrap, body, clone, hi, store: {}, pen });
+    pen += gl.adv + tracking;
+  }
+  out.width = pen - tracking;
+  return out;
+}
+
+// ───────────────────────── sections (stacking is set per frame) ─────────────────────────
+const S = {};
+for (const k of ['world', 'lock', 'desk', 'web', 'win', 'card', 'wall', 'order', 'open', 'iris', 'glass', 'cursor']) S[k] = el('div', 'sec');
+
+// ───────────────────────── open: wordmark, dot, pill, label ─────────────────────────
+const WORD = 'Hang', FS = 250, DOT = Math.round(FS * 0.2), DOT_GAP = Math.round(FS * 0.055);
+const letters = [...WORD].map(ch => {
+  const s = el('span', 'L', S.open, ch);
+  css(s, { fontFamily: 'Archivo', fontSize: px(FS), lineHeight: '1', whiteSpace: 'pre', color: INK, fontWeight: 800 });
+  return s;
+});
+const pill = el('div', 'L clip', S.open);
+css(pill, { background: INK });
+const label = el('div', 'L geist', pill, 'Print what you love.');
+css(label, { color: PAPER, fontSize: '54px', fontWeight: 600, letterSpacing: '-0.015em', whiteSpace: 'pre', lineHeight: '1' });
+const WM = {};   // wordmark metrics, filled by measure()
+
+function measure() {
+  const probe = el('span', 'L', stage);
+  css(probe, { fontFamily: 'Archivo', fontSize: px(FS), lineHeight: '1', fontWeight: 800, whiteSpace: 'pre', visibility: 'hidden' });
+  const widthAt = (ch, wd) => { probe.textContent = ch; probe.style.fontVariationSettings = `'wdth' ${wd}, 'wght' 800`; return widthOf(probe); };
+  const WD = [62, 70, 80, 90, 100, 110, 125];
+  WM.table = [...WORD].map(ch => WD.map(wd => [wd, widthAt(ch, wd)]));
+  WM.adv = WM.table.map(row => row[row.length - 1][1]);
+  // baseline: an empty inline-block sits on the baseline
+  probe.innerHTML = 'H<span style="display:inline-block;width:0;height:0"></span>';
+  probe.style.fontVariationSettings = `'wdth' 125, 'wght' 800`;
+  const pr = probe.getBoundingClientRect(), br = probe.lastChild.getBoundingClientRect();
+  WM.base = br.top - pr.top;
+  probe.remove();
+  const total = WM.adv.reduce((a, v) => a + v, 0) + DOT_GAP + DOT;
+  WM.x0 = C - total / 2;
+  WM.baseY = C + FS * 0.36;
+  WM.left = []; let x = WM.x0;
+  for (const a of WM.adv) { WM.left.push(x); x += a; }
+  WM.dot = [x + DOT_GAP + DOT / 2, WM.baseY - DOT / 2];
+  WM.labelW = widthOf(label);
+}
+// width axis first, scaleX for the rest; returns [wdth, scaleX] for a target ratio of the 125 width
+function squeeze(i, k) {
+  const row = WM.table[i], full = row[row.length - 1][1], target = full * k;
+  if (target <= row[0][1]) return [62, target / row[0][1]];
+  for (let j = 1; j < row.length; j++) {
+    if (target <= row[j][1]) {
+      const [w0, a0] = row[j - 1], [w1, a1] = row[j];
+      return [w0 + (w1 - w0) * (target - a0) / (a1 - a0), 1];
+    }
+  }
+  return [125, 1];
+}
+// wordmark squeeze factor: 1 = full word, 0 = folded into its dot
+const wordK = t => t < b(30) ? clamp(1 - spring(t - b(2), 2.4, 0.92), 0, 1) : clamp(spring(t - b(53) + 0.04, 3.4, 0.66), 0, 1.04);
+function renderWordmark(t) {
+  const k = wordK(t);
+  const [dx] = WM.dot;
+  letters.forEach((s, i) => {
+    const [wd, sx] = squeeze(i, Math.max(k, 0.0005));
+    const x = dx + (WM.left[i] - dx) * k;
+    s.style.fontVariationSettings = `'wdth' ${wd.toFixed(2)}, 'wght' 800`;
+    s.style.transform = `translate(${x}px, ${WM.baseY - WM.base}px) scaleX(${sx})`;
+    show(s, k > 0.004);
+  });
+}
+// dot → pill → iris housing (open), and the reverse at the end
+function pillRect(t) {
+  const d = WM.dot, D = DOT;
+  const dotR = [d[0] - D / 2, d[1] - D / 2, D, D];
+  const PILL = [C - 380, C - 75, 760, 150];
+  const RING = [C - 320, C - 320, 640, 640];
+  if (t < b(30)) return rectTrack(t, [[0, dotR], [b(3), PILL, 2.6, 0.7], [b(5), RING, 3.2, 0.78]]);
+  // full screen as a circle wider than the diagonal, so the corners stay covered
+  const FULL = [C - 1120, C - 1120, 2240, 2240];
+  return rectTrack(t, [[0, FULL], [b(52), PILL, 3.0, 0.8], [b(52) + 0.24, dotR, 3.6, 0.82]]);
+}
+function renderOpen(t) {
+  const on = t < b(7) || t >= b(51) + 0.32;
+  show(S.open, on);
+  if (!on) return;
+  renderWordmark(t);
+  const [x, y, w, h] = pillRect(t);
+  box(pill, x, y, w, h, { borderRadius: px(Math.min(w, h) / 2) });
+  show(pill, true);
+  const rise = spring(t - b(4), 3.4, 0.74);
+  label.style.transform = `translate(${(w - WM.labelW) / 2}px, ${h / 2 - 27 + (1 - rise) * (h / 2 + 54)}px)`;
+  show(label, t >= b(4) && t < b(6) - 0.01);
+}
+
+// ───────────────────────── iris: six blades around a hexagonal opening ─────────────────────────
+function irisSvg(parent, clipId) {
+  const svg = sel('svg', { class: 'L' }, parent);
+  const cp = sel('clipPath', { id: clipId }, defs);
+  const shape = sel('rect', {}, cp);
+  const g = sel('g', { 'clip-path': `url(#${clipId})` }, svg);
+  const blades = Array.from({ length: 6 }, () => sel('path', { fill: '#191919', stroke: 'rgba(255,255,255,.24)', 'stroke-width': 1.6, 'stroke-linejoin': 'round' }, g));
+  return { svg, shape, blades };
+}
+// aperture a: 0 = closed, 1 = fully open for a window whose corners are at radius R
+function bladePaths(R, a, twist) {
+  const rOpen = R / Math.cos(Math.PI / 6) * 1.04;
+  const r = Math.max(0.001, a * rOpen), Rout = R * 2.2;
+  const th0 = twist + (1 - a) * 0.75;
+  const V = k => [r * Math.cos(th0 + k * Math.PI / 3), r * Math.sin(th0 + k * Math.PI / 3)];
+  // where side k (V_k→V_{k+1}) extended beyond V_{k+1} meets the outer circle
+  const P = k => {
+    const [ax, ay] = V(k), [bx, by] = V(k + 1);
+    let dx = bx - ax, dy = by - ay; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+    const bd = bx * dx + by * dy, cc = bx * bx + by * by - Rout * Rout;
+    const s = -bd + Math.sqrt(bd * bd - cc);
+    return [bx + s * dx, by + s * dy];
+  };
+  const f = p => `${p[0].toFixed(2)} ${p[1].toFixed(2)}`;
+  return Array.from({ length: 6 }, (_, k) => {
+    const v1 = V(k + 1), v2 = V(k + 2), p1 = P(k + 1), p0 = P(k);
+    return `M${f(v1)}L${f(v2)}L${f(p1)}A${Rout} ${Rout} 0 0 0 ${f(p0)}Z`;
+  });
+}
+function placeIris(ir, x, y, w, h, a, round) {
+  css(ir.svg, { width: px(w), height: px(h), transform: `translate(${x}px, ${y}px)` });
+  ir.svg.setAttribute('viewBox', `${-w / 2} ${-h / 2} ${w} ${h}`);
+  for (const [k, v] of Object.entries({ x: -w / 2, y: -h / 2, width: w, height: h, rx: round ? w / 2 : 0 })) ir.shape.setAttribute(k, v);
+  bladePaths(Math.hypot(w, h) / 2 / (round ? Math.SQRT2 : 1), a, 0.3).forEach((d, i) => ir.blades[i].setAttribute('d', d));
+}
+const iris1 = irisSvg(S.iris, 'irisClip');
+const irisA = t => clamp(track(t, [[0, 1], [b(5), 0, 3.6, 0.85], [b(6), 1, 5.2, 0.5]]), 0, 1.02);
+function renderIris(t) {
+  const on = t >= b(5) && t < b(6) + 0.45;
+  show(S.iris, on);
+  if (!on) return;
+  const [x, y, w, h] = pillRect(t);
+  placeIris(iris1, x, y, w, h, irisA(t), true);
+}
+
+// ───────────────────────── world: grid → bento → zoom onto the droplet ─────────────────────────
+css(S.world, { overflow: 'visible' });
+const world = el('div', 'L', S.world);
+css(world, { width: px(W), height: px(W) });
+const G0 = 120, GAP = 24, CELL = (1200 - 2 * GAP) / 3, UNIT = (1200 - 3 * GAP) / 4;
+const uni = (r, c) => [G0 + c * (CELL + GAP), G0 + r * (CELL + GAP), CELL, CELL];
+const ben = (c, r, w, h) => [G0 + c * (UNIT + GAP), G0 + r * (UNIT + GAP), w * UNIT + (w - 1) * GAP, h * UNIT + (h - 1) * GAP];
+const CELLS = [
+  { key: 'facade', u: [0, 0], bento: ben(2, 0, 1, 1), fold: { from: 'right', ring: 2 } },
+  { key: 'poppies', u: [0, 1], bento: ben(3, 0, 1, 1), fold: { from: 'bottom', ring: 1 } },
+  { key: 'pool', u: [0, 2], bento: ben(1, 1, 1, 1), fold: { from: 'left', ring: 2 } },
+  { key: 'cat', u: [1, 0], bento: ben(0, 1, 1, 2), fold: { from: 'right', ring: 1 } },
+  { key: 'lemons', u: [1, 1], bento: ben(0, 0, 2, 1), fold: null },
+  { key: 'dropDay', u: [1, 2], bento: ben(2, 1, 2, 2), fold: { from: 'left', ring: 1 } },
+  { key: 'oranges', u: [2, 0], bento: ben(1, 2, 1, 1), fold: { from: 'right', ring: 2 } },
+  { key: 'dunes', u: [2, 1], bento: ben(0, 3, 2, 1), fold: { from: 'top', ring: 1 } },
+  { key: 'umbrellas', u: [2, 2], bento: ben(2, 3, 2, 1), fold: { from: 'left', ring: 2 } },
+];
+for (const c of CELLS) {
+  c.el = el('div', 'L clip', world);
+  if (c.key === 'dropDay') { c.gold = photo('dropGold', c.el); c.img = photo('dropDay', c.el); }
+  else c.img = photo(c.key, c.el);
+}
+const lemonCell = CELLS.find(c => c.key === 'lemons');
+const dropCell = CELLS.find(c => c.key === 'dropDay');
+const DROP_RECT = dropCell.bento;
+const DROP_W = [DROP_RECT[0] + DROP.x * DROP_RECT[2], DROP_RECT[1] + DROP.y * DROP_RECT[3]];   // droplet in world
+const ZOOM = 2.52;
+function camera(t) {
+  // the zoom-out waits until the sphere covers the frame; only the cursor shows it
+  const Z = track(t, [[0, 1], [b(13), ZOOM, 1.35, 0.92], [b(26) + 0.33, 1, 1.6, 1]]);
+  const [fx, fy] = track2(t, [[0, [C, C]], [b(13), DROP_W, 1.35, 0.92], [b(26) + 0.33, [C, C], 1.6, 1]]);
+  return { Z, fx, fy };
+}
+const toScreen = (cam, p) => [C + cam.Z * (p[0] - cam.fx), C + cam.Z * (p[1] - cam.fy)];
+function cellRect(c, t) {
+  if (c === lemonCell) return rectTrack(t, [[0, [C - 320, C - 320, 640, 640]], [b(8), uni(1, 1), 2.8, 0.78], [b(11), c.bento, 2.4, 0.8]]);
+  return rectTrack(t, [[0, uni(...c.u)], [b(11), c.bento, 2.4, 0.8]]);
+}
+const cellRadius = (c, t) => c === lemonCell ? track(t, [[0, 320], [b(7), 28, 3.4, 0.8], [b(8), 20, 2.8, 0.78]]) : 20;
+// day → golden: a hard vertical split that follows the slider
+const sliderP = t => clamp(track(t, [[0, 0], [b(21) + 0.05, 1, 1.5, 1]]), 0, 1);
+function goldenSplit(t, cam) {
+  const lineX = sliderP(t) * W;
+  const [cx] = toScreen(cam, [DROP_RECT[0], DROP_RECT[1]]);
+  return { lineX, cellX: clamp((lineX - cx) / cam.Z, 0, DROP_RECT[2]) };
+}
+function renderWorld(t) {
+  const on = t >= b(6) - 0.02 && t < b(26) + 0.35;
+  show(S.world, on);
+  const cam = camera(t);
+  if (!on) return cam;
+  world.style.transform = `translate(${C - cam.Z * cam.fx}px, ${C - cam.Z * cam.fy}px) scale(${cam.Z})`;
+  for (const c of CELLS) {
+    const [x, y, w, h] = cellRect(c, t);
+    let sx = 1, sy = 1, ox = '50%', oy = '50%';
+    if (c.fold) {
+      const start = c.fold.ring === 1 ? b(9) : b(10);
+      const u = clamp(spring(t - start, 3.0, 0.82), 0, 1.025);
+      if (c.fold.from === 'left' || c.fold.from === 'right') { sx = u; ox = c.fold.from === 'left' ? '0%' : '100%'; }
+      else { sy = u; oy = c.fold.from === 'top' ? '0%' : '100%'; }
+      show(c.el, t >= start);
+    } else show(c.el, true);
+    css(c.el, { width: px(w), height: px(h), borderRadius: px(cellRadius(c, t)), transformOrigin: `${ox} ${oy}`,
+      transform: `translate(${x}px, ${y}px) scale(${sx}, ${sy})` });
+    for (const im of [c.img, c.gold].filter(Boolean)) { im.style.width = px(w); im.style.height = px(h); }
+  }
+  dropCell.img.style.clipPath = `inset(0 0 0 ${goldenSplit(t, cam).cellX}px)`;
+  return cam;
+}
+// a copy of the droplet cell (with the same split) for glass that sits over it; (ox, oy) is the copy's
+// screen origin and s its screen scale
+function worldBackdrop(clone, store, t, cam, ox, oy, s = 1) {
+  if (!store.day) { store.gold = photo('dropGold', clone); store.day = photo('dropDay', clone); }
+  const [sx, sy] = toScreen(cam, [DROP_RECT[0], DROP_RECT[1]]);
+  const size = DROP_RECT[2] * cam.Z;
+  for (const im of [store.gold, store.day]) css(im, { width: px(size / s), height: px(size / s), transform: `translate(${(sx - ox) / s}px, ${(sy - oy) / s}px)` });
+  store.day.style.clipPath = `inset(0 0 0 ${goldenSplit(t, cam).cellX * cam.Z / s}px)`;
+}
+
+// ───────────────────────── glass: letters → melt → toolbar → slider → lens → sphere ─────────────────────────
+const gooF = sel('filter', { id: 'goo', x: 0, y: 0, width: W, height: W, filterUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' }, defs);
+const gooBlur = sel('feGaussianBlur', { in: 'SourceGraphic', stdDeviation: 0, result: 'b' }, gooF);
+sel('feColorMatrix', { in: 'b', type: 'matrix', values: '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 22 -9', result: 'g' }, gooF);
+sel('feComposite', { in: 'SourceGraphic', in2: 'g', operator: 'atop' }, gooF);
+// blur + alpha threshold only while things merge; ramps keep the edges from popping
+function gooAmount(t) {
+  const win = (a, z) => clamp((t - a) / 0.12) * clamp((z - t) / 0.12);
+  return 12 * Math.max(win(b(17), b(18) + 0.45), win(b(23) + 0.12, b(23) + 0.7));
+}
+const BAR = { x: C - 380, y: 1160, w: 760, h: 124 };
+const SLIDE = { x0: 120, x1: 640 };
+const KNOB = [BAR.x + SLIDE.x1, BAR.y + BAR.h / 2];
+let LIGHT = null;            // glass letters of "Light", built after the fonts load
+const LIGHT_BASE = 600;
+const bar = glassPanel(S.glass);
+const ICONS = ['crop', 'adjust', 'filters', 'share'];
+const iconEls = ICONS.map(n => {
+  const s = sel('svg', { class: 'L', width: 56, height: 56, viewBox: '0 0 56 56', fill: 'none', stroke: INK, 'stroke-width': 3.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, bar.ui);
+  const d = {
+    crop: 'M18 8v30h30 M8 18h30v30',
+    adjust: 'M28 12a16 16 0 1 0 0.01 0Z M28 12v32',
+    filters: 'M22 22m-10 0a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M34 22m-10 0a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M28 33m-10 0a10 10 0 1 0 20 0a10 10 0 1 0-20 0',
+    share: 'M28 8v26 M19 17l9-9 9 9 M14 26v20h28V26',
+  }[n];
+  sel('path', { d }, s);
+  if (n === 'adjust') sel('path', { d: 'M28 12a16 16 0 0 1 0 32Z', fill: INK, stroke: 'none' }, s);
+  return s;
+});
+const sliderTrack = el('div', 'L', bar.ui); css(sliderTrack, { background: INK, borderRadius: '3px' });
+const knob = el('div', 'L', bar.ui); css(knob, { background: INK, borderRadius: '50%' });
+const sphere = glassPanel(S.glass);
+const sphereShade = el('div', 'L', sphere.outer);
+
+function barRect(t) {
+  const grow = clamp(spring(t - b(17) - 0.3, 3.0, 0.74), 0, 1.05);
+  let w = BAR.w * grow, h = BAR.h * clamp(grow * 1.4, 0, 1), x = C - w / 2, y = BAR.y + (BAR.h - h) / 2;
+  // long-press: the bar pours into the knob, which becomes the lens
+  const into = clamp(spring(t - b(23) - 0.18, 2.8, 0.9), 0, 1);
+  x = lerp(x, KNOB[0] - 23, into); y = lerp(y, KNOB[1] - 23, into); w = lerp(w, 46, into); h = lerp(h, 46, into);
+  return [x, y, w, h, grow];
+}
+function sphereState(t) {
+  const [x, y] = track2(t, [[0, KNOB], [b(24), [C, 600], 2.0, 1], [b(24) + 0.01, [C, 600], 6, 1], [b(26), [C, C], 3.2, 0.95]]);
+  const r = track(t, [[0, 23], [b(23) + 0.18, 86, 3.2, 0.7], [b(24), 262, 2.2, 0.78], [b(26), 1240, 3.0, 0.97]]);
+  const ri = clamp(spring(t - b(25), 3.0, 0.8), 0, 1.03) * 0.84 * r;
+  return { x, y, r, ri };
+}
+function lightLayout(t) {
+  // letters rise on sixteenth notes, then melt down into the bar
+  return LIGHT.map((L, i) => {
+    const x = C - LIGHT.width / 2 + L.pen - L.gl.ox, y = LIGHT_BASE - L.gl.oy;
+    const rise = riseY(t, b(15) + i * BEAT / 4, null, L.gl.h);
+    const ts = b(17) + i * 0.04;
+    const fall = spring(t - ts, 2.4, 0.86);
+    const cx = x + L.gl.w / 2, cy = y + L.gl.h / 2;
+    const tx = (C + (i - 2) * 100 - cx) * fall, ty = (BAR.y + BAR.h / 2 - cy) * fall;
+    const sc = clamp(1 - 0.97 * spring(t - ts - 0.04, 2.6, 1), 0, 1);
+    return { L, x, y, rise, tx, ty, sc };
+  });
+}
+function renderGlass(t, cam) {
+  const on = t >= b(15) && t < b(26) + 0.35;
+  show(S.glass, on);
+  if (!on) return;
+  const g = gooAmount(t);
+  gooBlur.setAttribute('stdDeviation', g.toFixed(2));
+  S.glass.style.filter = g > 0.01 ? 'url(#goo)' : 'none';
+  // letters
+  for (const s of lightLayout(t)) {
+    const { L, x, y, rise, tx, ty, sc } = s;
+    const melting = t >= b(17);
+    box(L.wrap, x, y, L.gl.w, L.gl.h, { overflow: melting ? 'visible' : 'hidden' });
+    // scale about the glyph centre, written as translate + scale with origin 0 0
+    const bx = tx + (1 - sc) * L.gl.w / 2, by = (melting ? ty : rise) + (1 - sc) * L.gl.h / 2;
+    L.body.style.transform = `translate(${bx}px, ${by}px) scale(${sc})`;
+    worldBackdrop(L.clone, L.store, t, cam, x + bx, y + by, sc);
+    show(L.wrap, t >= b(15) + LIGHT.indexOf(L) * BEAT / 4 - 0.01 && sc > 0.06);
+  }
+  // toolbar
+  const [x, y, w, h, grow] = barRect(t);
+  const barOn = t >= b(17) + 0.3 && w > 47;
+  show(bar.outer, barOn);
+  if (barOn) {
+    const o = placeGlass(bar, x, y, w, h, h / 2);
+    worldBackdrop(bar.clone, bar.store, t, cam, o.ox, o.oy);
+    const tap = pulse(t, b(19), 0.12, 5, 0.5);
+    const toSlider = clamp(spring(t - b(20), 3.2, 0.82), 0, 1);
+    ICONS.forEach((n, i) => {
+      const s = iconEls[i];
+      const pop = clamp(spring(t - b(18) - i * 0.05, 3.6, 0.6), 0, 1.2);
+      const cx = w / 2 + (i - 1.5) * 150 * grow, cy = h / 2;
+      let sc = pop * (n === 'adjust' ? 1 - 0.18 * tap : 1 - toSlider);
+      const tx = n === 'adjust' ? lerp(cx, SLIDE.x0 * grow, toSlider) : cx;
+      s.style.transform = `translate(${tx - 28 * sc}px, ${cy - 28 * sc}px) scale(${sc})`;
+      show(s, sc > 0.02 && !(n === 'adjust' && toSlider > 0.5));
+    });
+    const p = sliderP(t);
+    const kx = lerp(SLIDE.x0, SLIDE.x1, p) * grow;
+    box(sliderTrack, SLIDE.x0 * grow, h / 2 - 3, (SLIDE.x1 - SLIDE.x0) * toSlider * (w / BAR.w), 6);
+    const ks = 46 * toSlider * clamp(1 - spring(t - b(23) - 0.18, 3.2, 0.8), 0, 1);
+    box(knob, kx - ks / 2 + (x - (C - BAR.w * grow / 2)) * 0, h / 2 - ks / 2, ks, ks);
+    show(sliderTrack, toSlider > 0.01 && t < b(23) + 0.2); show(knob, toSlider > 0.5 && ks > 1);
+  }
+  // lens → sphere → expands into the lock screen
+  const sp = sphereState(t);
+  const sOn = t >= b(23) + 0.18;
+  show(sphere.outer, sOn);
+  if (sOn) {
+    const d = 2 * sp.r;
+    const scale = (sp.r < 90 ? 70 : 150) * clamp(1 - (sp.r - 262) / 700, 0, 1);
+    const o = placeGlass(sphere, sp.x - sp.r, sp.y - sp.r, d, d, sp.r, { circle: true, scale });
+    worldBackdrop(sphere.clone, sphere.store, t, cam, o.ox, o.oy);
+    const st = sphere.store;
+    if (!st.seaWrap) { st.seaWrap = el('div', 'L clip', sphere.clone); st.sea = photo('sea', st.seaWrap); }
+    box(st.seaWrap, sp.x - sp.ri - o.ox, sp.y - sp.ri - o.oy, 2 * sp.ri, 2 * sp.ri, { borderRadius: '50%' });
+    css(st.sea, { width: px(W), height: px(W), transform: `translate(${sp.ri - C}px, ${sp.ri - C}px)` });
+    show(st.seaWrap, sp.ri > 0.5);
+    // shading lives near the rim, so it leaves the frame as the sphere grows
+    const r = sp.r, hx = r - 0.62 * r, hy = r - 0.78 * r;
+    box(sphereShade, 0, 0, d, d, { borderRadius: '50%',
+      background: `radial-gradient(circle ${0.1 * r}px at ${hx}px ${hy}px, rgba(255,255,255,.7), rgba(255,255,255,0)),` +
+        `radial-gradient(circle ${r}px at ${r}px ${r}px, rgba(0,0,0,0) ${Math.max(0, r - 60)}px, rgba(0,0,0,.14) ${Math.max(0, r - 14)}px, rgba(255,255,255,.55) ${r - 2}px, rgba(255,255,255,.2) ${r}px)` });
+  }
+}
+
+// ───────────────────────── lock screen → phone ─────────────────────────
+const lockClip = el('div', 'L clip', S.lock);
+const lockGroup = el('div', 'L', lockClip);
+css(lockGroup, { width: px(W), height: px(W) });
+const lockWall = photo('sea', lockGroup);
+const dateWrap = el('div', 'L clip', lockGroup);
+const dateEl = text(dateWrap, 'Saturday, June 20', { fontSize: '42px', fontWeight: 600, letterSpacing: '-0.01em' });
+let CLOCK = null;           // glass digits "18:24"
+const CLOCK_BASE = 560;
+const homeBar = el('div', 'L', lockGroup); css(homeBar, { background: INK });
+const player = glassPanel(lockGroup);
+const plTitle = text(player.ui, 'Winter Breeze', { fontSize: '34px', fontWeight: 650, letterSpacing: '-0.01em' });
+const plArtist = text(player.ui, 'Arulo', { fontSize: '25px', fontWeight: 500, color: '#2b2a28' });
+const plLine = el('div', 'L', player.ui); css(plLine, { background: INK, borderRadius: '2px' });
+const plLineBg = el('div', 'L', player.ui); css(plLineBg, { background: 'rgba(13,13,13,.18)', borderRadius: '2px' });
+const plIcons = sel('svg', { class: 'L', width: 220, height: 56, viewBox: '0 0 220 56' }, player.ui);
+sel('path', { d: 'M30 14v28 M54 14L34 28l20 14Z', fill: INK, stroke: INK, 'stroke-width': 4, 'stroke-linejoin': 'round' }, plIcons);
+sel('path', { d: 'M98 12h9v32h-9Z M114 12h9v32h-9Z', fill: INK }, plIcons);
+sel('path', { d: 'M190 14v28 M166 14l20 14-20 14Z', fill: INK, stroke: INK, 'stroke-width': 4, 'stroke-linejoin': 'round' }, plIcons);
+const bezel = el('div', 'L', S.lock); css(bezel, { background: INK });
+S.lock.insertBefore(bezel, lockClip);   // the bezel sits behind the screen
+const island = el('div', 'L', S.lock);
+const islandParts = [0, 1, 2].map(() => { const e = el('div', 'L', island); css(e, { background: INK }); return e; });
+const gooF2 = sel('filter', { id: 'goo2', x: 0, y: 0, width: W, height: W, filterUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' }, defs);
+sel('feGaussianBlur', { in: 'SourceGraphic', stdDeviation: 7, result: 'b' }, gooF2);
+sel('feColorMatrix', { in: 'b', type: 'matrix', values: '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 26 -11' }, gooF2);
+css(island, { width: px(W), height: px(W), filter: 'url(#goo2)' });
+const PHONE = [440, 114, 560, 1212];
+const GS = 0.84;
+function lockClipRect(t) {
+  const [x, y, w, h] = rectTrack(t, [[0, [0, 0, W, W]], [b(29), PHONE, 2.6, 0.84]]);
+  return { x, y, w, h, r: track(t, [[0, 0], [b(29), 66, 2.6, 0.84]]), gs: track(t, [[0, 1], [b(29), GS, 2.6, 0.84]]) };
+}
+function islandState(t) {
+  // pops in with the bezel, stretches like liquid (b30), narrows, then flies up (b31)
+  const show_ = clamp(spring(t - b(29) - 0.3, 4, 0.6), 0, 1.15);
+  const w = 132 * show_ + track(t, [[0, 0], [b(30), 300, 3.4, 0.45], [b(30) + 0.22, -40, 3.6, 0.7]]);
+  const h = 38 * show_ + track(t, [[0, 0], [b(30), 12, 3.4, 0.5], [b(30) + 0.22, -6, 3.6, 0.7]]);
+  const cy = PHONE[1] + 24 + 19 - spring(t - b(31), 4.5, 0.9) * 130;
+  return { x: C - w / 2, y: cy - h / 2, w, h };
+}
+function renderLock(t) {
+  const on = t >= b(26) + 0.3 && t < b(31) + 0.3;
+  show(S.lock, on);
+  if (!on) return;
+  const L = lockClipRect(t);
+  box(lockClip, L.x, L.y, L.w, L.h, { borderRadius: px(L.r) });
+  // the group is the 1440² lock screen scaled about the centre, expressed in the clip's coordinates
+  const gx = C - L.gs * C - L.x, gy = C - L.gs * C - L.y;
+  lockGroup.style.transform = `translate(${gx}px, ${gy}px) scale(${L.gs})`;
+  box(lockWall, 0, 0, W, W);
+  // date and glass clock rise from their mask lines
+  const dw = widthOf(dateEl) / 1;
+  box(dateWrap, C - 400, 230, 800, 60);
+  dateEl.style.transform = `translate(${400 - dw / 2}px, ${riseY(t, b(27), null, 60) + 9}px)`;
+  CLOCK.forEach((G, i) => {
+    const x = C - CLOCK.width / 2 + G.pen - G.gl.ox, y = CLOCK_BASE - G.gl.oy;
+    box(G.wrap, x, y, G.gl.w, G.gl.h, { overflow: 'hidden' });
+    const ry = riseY(t, b(27) + 0.05 + i * BEAT / 4 * 0.5, null, G.gl.h);
+    G.body.style.transform = `translate(0px, ${ry}px)`;
+    if (!G.store.wall) { G.store.wall = photo('sea', G.clone); }
+    css(G.store.wall, { width: px(W), height: px(W), transform: `translate(${-x}px, ${-(y + ry)}px)` });
+    show(G.wrap, t >= b(27));
+  });
+  // home bar → glass music player
+  const hb = clamp(spring(t - b(27) - 0.25, 4, 0.7), 0, 1.1);
+  const open = clamp(spring(t - b(28), 3.0, 0.72), 0, 1.06);
+  const pw = lerp(200 * hb, 640, open), ph = lerp(12, 176, open), px_ = C - pw / 2, py = lerp(1290, 1060, open);
+  box(homeBar, px_, py, pw, ph, { borderRadius: px(ph / 2) });
+  show(homeBar, hb > 0.02 && open < 0.08);
+  show(player.outer, open >= 0.08);
+  if (open >= 0.08) {
+    const r = Math.min(44, ph / 2);
+    const o = placeGlass(player, px_, py, pw, ph, r, { bezel: 40, scale: 90 });
+    if (!player.store.wall) player.store.wall = photo('sea', player.clone);
+    css(player.store.wall, { width: px(W), height: px(W), transform: `translate(${-o.ox}px, ${-o.oy}px)` });
+    const c = clamp(spring(t - b(28) - 0.15, 3.4, 0.8), 0, 1);
+    plTitle.style.transform = `translate(40px, ${36 + (1 - c) * 60}px)`;
+    plArtist.style.transform = `translate(40px, ${80 + (1 - c) * 60}px)`;
+    const lw = 560 * clamp(spring(t - b(28) - 0.2, 2.6, 1), 0, 1);
+    box(plLineBg, 40, 132, 560, 5); box(plLine, 40, 132, lw * 0.18, 5);
+    show(plLineBg, lw > 1); show(plLine, lw > 1);
+    css(plIcons, { transform: `translate(${pw - 260}px, ${46 + (1 - c) * 60}px)` });
+  }
+  // the phone: bezel springs out of the screen edges
+  const bz = 22 * clamp(spring(t - b(29) - 0.16, 4, 0.48), 0, 1.4);
+  box(bezel, L.x - bz, L.y - bz, L.w + 2 * bz, L.h + 2 * bz, { borderRadius: px(L.r + bz), boxShadow: `0 ${30 * bz / 22}px ${60 * bz / 22}px rgba(0,0,0,.18)` });
+  show(bezel, bz > 0.2);
+  const is = islandState(t);
+  // three blobs (two ends and a neck): the goo filter makes the stretch read as liquid
+  const neck = clamp(1 - (is.w - 132) / 700, 0.62, 1);
+  box(islandParts[0], is.x, is.y, is.h, is.h, { borderRadius: '50%' });
+  box(islandParts[1], is.x + is.w - is.h, is.y, is.h, is.h, { borderRadius: '50%' });
+  box(islandParts[2], is.x + is.h / 2, is.y + is.h * (1 - neck) / 2, Math.max(0, is.w - is.h), is.h * neck);
+  show(island, is.w > 4 && t < b(31) + 0.02);
+}
+
+// ───────────────────────── desk: window, blinds, long-press, drag to the tab ─────────────────────────
+const deskWall = photo('sea', S.desk);
+const menu = el('div', 'L geist', S.desk);
+css(menu, { background: 'rgba(242,238,230,.94)', color: INK, fontSize: '19px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '30px', padding: '0 26px', whiteSpace: 'pre' });
+menu.innerHTML = '<b style="font-family:Archivo;font-variation-settings:\'wdth\' 125,\'wght\' 800;font-size:21px">Hang.</b><span>File</span><span>Edit</span><span>View</span><span>Window</span><span style="margin-left:auto;font-weight:500">Sat 18:24</span>';
+const win = el('div', 'L clip', S.win); css(win, { background: INK });
+const winBar = el('div', 'L geist', win);
+css(winBar, { color: PAPER, display: 'flex', alignItems: 'center', gap: '14px', padding: '0 22px', fontSize: '19px', fontWeight: 500, whiteSpace: 'pre' });
+winBar.innerHTML = '<i style="width:13px;height:13px;border-radius:50%;background:#5a5a5a"></i><i style="width:13px;height:13px;border-radius:50%;background:#5a5a5a"></i><i style="width:13px;height:13px;border-radius:50%;background:#5a5a5a;margin-right:22px"></i>'
+  + '<span style="background:#2a2a2a;border-radius:10px;padding:9px 18px">hang.prints</span><span style="opacity:.55;padding:9px 6px">New Tab</span>';
+const winBody = text(win, 'hang.prints', { fontSize: '30px', fontWeight: 500, color: '#7a766f' });
+const slats = el('div', 'L', win);
+const WIN = [170, 190, 1100, 800], TABBAR = [0, 40, W, 70];
+function winState(t) {
+  const is = islandState(b(31));
+  const up = [C - 70, PHONE[1] + 24 - 130, 140, 40];
+  const keys = [[0, [is.x, is.y, is.w, is.h]], [b(31), up, 4.5, 0.9], [b(31) + 0.1, [-300, -300, W + 600, W + 600], 3.4, 0.95],
+    [b(32), WIN, 2.8, 0.82], [b(33), TABBAR, 2.4, 0.9]];
+  const [x, y, w, h] = rectTrack(t, keys);
+  const roll = clamp(spring(t - b(33), 2.4, 0.9), 0, 1);
+  const rTop = t < b(31) + 0.05 ? h / 2 : lerp(26, 0, roll) * clamp(spring(t - b(32), 2.8, 0.82)), rBot = t < b(31) + 0.05 ? h / 2 : lerp(26, 18, roll) * clamp(spring(t - b(32), 2.8, 0.82));
+  return { x, y, w, h, rTop, rBot, roll };
+}
+const card = el('div', 'L clip', S.card);
+const cardImg = photo('sea', card);
+const pushY = t => -1560 * spring(t - b(41), 2.0, 0.92);           // the whole browser leaves at the order
+const pageH = t => 1330 * clamp(spring(t - b(35) - 0.12, 2.8, 0.92), 0, 1);
+function renderDesk(t) {
+  const on = t >= b(32) - 0.05 && t < b(41) + 0.7;
+  show(S.desk, on);
+  if (!on) return;
+  // the page pushes the desktop down and out; once it is gone it stays gone
+  box(deskWall, 0, pageH(t), W, W);
+  show(deskWall, pageH(t) < 1329);
+  box(menu, 0, pushY(t), W, 40);
+}
+function renderWin(t) {
+  const on = t >= b(31) && t < b(41) + 0.7;
+  show(S.win, on);
+  if (!on) return;
+  const s = winState(t);
+  const py = pushY(t);
+  box(win, s.x, s.y + py, s.w, s.h, { borderRadius: `${s.rTop}px ${s.rTop}px ${s.rBot}px ${s.rBot}px` });
+  const chrome = clamp(spring(t - b(32) - 0.1, 3.4, 0.8), 0, 1);
+  box(winBar, 0, (1 - chrome) * 70, s.w, 70);
+  show(winBar, t >= b(32));
+  const bw = widthOf(winBody);
+  winBody.style.transform = `translate(${(s.w - bw) / 2}px, ${(WIN[3] - 30) / 2 + (1 - chrome) * 60}px)`;
+  show(winBody, t >= b(32) && s.roll < 0.6);
+  // blinds: slats crowd together as the body rolls up
+  const gapPx = lerp(46, 6, s.roll);
+  box(slats, 0, 70, s.w, Math.max(0, s.h - 70), { background: `repeating-linear-gradient(180deg, rgba(255,255,255,.0) 0px, rgba(255,255,255,.0) ${gapPx - 2}px, rgba(255,255,255,.14) ${gapPx - 2}px, rgba(255,255,255,.14) ${gapPx}px)` });
+  show(slats, t >= b(33) && s.roll < 0.98);
+}
+// the wallpaper, lifted by a long-press, dragged to the tab, landed as the hero, then the print
+const HERO = [60, 330, 1320, 990];
+const FP = { x: 150, y: 236, w: 520, h: 728, mold: 26, mat: 64 };
+const PRINT_P = [FP.x + FP.mold + FP.mat, FP.y + FP.mold + FP.mat, FP.w - 2 * (FP.mold + FP.mat), FP.h - 2 * (FP.mold + FP.mat)];
+function cardRect(t) {
+  const lift = clamp(spring(t - b(34) - 0.24, 3.4, 0.72), 0, 1.04);
+  const dragRect = tt => {
+    const l = clamp(spring(tt - b(34) - 0.24, 3.4, 0.72), 0, 1.04);
+    const [cx, cy] = cursorAt(tt);
+    const s = lerp(1, 0.5, l);
+    return [lerp(C, cx, l) - C * s, lerp(C, cy, l) - C * s, W * s, W * s];
+  };
+  if (t < b(36)) return { r: dragRect(t), rad: lerp(0, 30, lift), lift };
+  const r = rectTrack(t, [[0, dragRect(b(36))], [b(36), HERO, 2.6, 0.84], [b(37), PRINT_P, 2.4, 0.86]]);
+  const rad = track(t, [[0, 30], [b(36), 28, 2.6, 0.84], [b(37), 0, 2.4, 0.86]]);
+  return { r, rad, lift: 1 - clamp(spring(t - b(36), 2.6, 0.84), 0, 1) };
+}
+function renderCard(t) {
+  const on = t >= b(34) + 0.24 && t < b(41) + 0.7;
+  show(S.card, on);
+  if (!on) return;
+  const { r: [x, y, w, h], rad, lift } = cardRect(t);
+  box(card, x, y + pushY(t), w, h, { borderRadius: px(rad), boxShadow: `0 ${30 * lift}px ${60 * lift}px rgba(0,0,0,${0.28 * lift}), 0 ${6 * lift}px ${14 * lift}px rgba(0,0,0,${0.18 * lift})` });
+  box(cardImg, 0, 0, w, h);
+}
+
+// ───────────────────────── web: landing page → product card ─────────────────────────
+const webClip = el('div', 'L clip', S.web); css(webClip, { background: PAPER });
+const webInner = el('div', 'L', webClip);
+const navMark = el('div', 'L', webInner, 'Hang.'); css(navMark, { fontFamily: 'Archivo', fontVariationSettings: "'wdth' 125, 'wght' 800", fontSize: '40px', lineHeight: '1', color: INK, whiteSpace: 'pre' });
+const navLinks = text(webInner, 'Prints     Frames     Gifts     Cart (0)', { fontSize: '23px', fontWeight: 500 });
+const headWrap = el('div', 'L clip', webInner);
+const headline = text(headWrap, 'Every photo deserves a wall.', { fontSize: '66px', fontWeight: 650, letterSpacing: '-0.035em' });
+const prodTitle = text(webInner, 'Seascape', { fontSize: '80px', fontWeight: 700, letterSpacing: '-0.04em' });
+const prodSub = text(webInner, 'Framed print · archival cotton rag', { fontSize: '26px', fontWeight: 500, color: '#5c574f' });
+const prodPrice = text(webInner, '€89', { fontSize: '42px', fontWeight: 600, letterSpacing: '-0.02em' });
+const lblFrame = text(webInner, 'Frame', { fontSize: '22px', fontWeight: 600 });
+const lblSize = text(webInner, 'Size', { fontSize: '22px', fontWeight: 600 });
+const OAK = 'linear-gradient(135deg, #c99b67, #a8774a 45%, #b88a59 70%, #93653c)';
+const SWATCH = [['Black', INK], ['Oak', OAK], ['White', '#FBFAF7']];
+const swatches = SWATCH.map(([, bg]) => { const e = el('div', 'L', webInner); css(e, { background: bg, borderRadius: '50%', boxShadow: 'inset 0 0 0 1.5px rgba(0,0,0,.18)' }); return e; });
+const swRing = el('div', 'L', webInner); css(swRing, { border: `2.5px solid ${INK}`, borderRadius: '50%' });
+const SIZES = ['30×40', '50×70', '70×100'];
+const chips = SIZES.map(s => {
+  const e = el('div', 'L clip', webInner); css(e, { border: `2px solid ${INK}`, borderRadius: '32px' });
+  const fill = el('div', 'L', e); css(fill, { background: INK, borderRadius: '50%' });
+  const tx = text(e, s, { fontSize: '24px', fontWeight: 500 });
+  const tw = text(e, s, { fontSize: '24px', fontWeight: 500, color: PAPER });
+  return { e, fill, tx, tw };
+});
+const molding = el('div', 'L', S.web); css(molding, { background: INK });
+const moldOak = el('div', 'L', S.web); css(moldOak, { background: OAK });
+const mat = el('div', 'L', S.web); css(mat, { background: '#FBFAF7', boxShadow: 'inset 2px 3px 6px rgba(0,0,0,.20)' });
+const SCROLL = 1150;   // the product section starts below the fold
+const SW_Y = 600, SW_X = 760, CHIP_Y = 742, CTA = [760, 870, 540, 100];
+const chipX = i => 760 + i * 158;
+function renderWeb(t) {
+  const on = t >= b(35) + 0.1 && t < b(41) + 0.7;
+  show(S.web, on);
+  if (!on) return;
+  const py = pushY(t);
+  box(webClip, 0, 110 + py, W, pageH(t));
+  const sc = SCROLL * clamp(spring(t - b(37), 2.4, 0.86), 0, 1.02);
+  webInner.style.transform = `translate(0px, ${-sc}px)`;
+  // positions are written in screen space after the scroll, so add SCROLL back and subtract the clip top
+  const Y = y => y + SCROLL - 110;
+  navMark.style.transform = `translate(60px, ${140 - 110}px)`;
+  navLinks.style.transform = `translate(${1380 - widthOf(navLinks)}px, ${150 - 110}px)`;
+  box(headWrap, 60, 214 - 110, 1320, 80);
+  headline.style.transform = `translate(0px, ${8 + riseY(t, b(36) - 0.1, null, 80)}px)`;
+  prodTitle.style.transform = `translate(760px, ${Y(296)}px)`;
+  prodSub.style.transform = `translate(762px, ${Y(398)}px)`;
+  prodPrice.style.transform = `translate(762px, ${Y(452)}px)`;
+  lblFrame.style.transform = `translate(762px, ${Y(560)}px)`;
+  lblSize.style.transform = `translate(762px, ${Y(702)}px)`;
+  swatches.forEach((s, i) => box(s, SW_X + i * 82, Y(SW_Y), 60, 60));
+  const ringX = track(t, [[0, SW_X], [b(39), SW_X + 82, 3.2, 0.72]]);
+  box(swRing, ringX - 8, Y(SW_Y) - 8, 76, 76);
+  chips.forEach((c, i) => {
+    box(c.e, chipX(i), Y(CHIP_Y), 142, 64);
+    const tw = widthOf(c.tx);
+    c.tx.style.transform = c.tw.style.transform = `translate(${(142 - tw) / 2}px, 20px)`;
+    // the selected chip fills from the click point
+    const f = i === 1 ? 190 * clamp(spring(t - b(40), 3.4, 0.9), 0, 1) : 0;
+    box(c.fill, 71 - f / 2, 32 - f / 2, f, f);
+    c.tw.style.clipPath = `circle(${f / 2}px at ${71 - (142 - tw) / 2}px 12px)`;
+    show(c.fill, f > 0.5); show(c.tw, f > 0.5);
+  });
+  // mat and molding pop out of the print's edges; oak is drawn round the frame
+  const [px_, py_, pw, ph] = PRINT_P;
+  const m1 = clamp(spring(t - b(38), 3.6, 0.55), 0, 1.3) * FP.mat, m2 = clamp(spring(t - b(38) - 0.12, 3.6, 0.55), 0, 1.3) * FP.mold;
+  box(mat, px_ - m1, py_ - m1 + py, pw + 2 * m1, ph + 2 * m1);
+  box(molding, px_ - m1 - m2, py_ - m1 - m2 + py, pw + 2 * (m1 + m2), ph + 2 * (m1 + m2), { boxShadow: `0 ${18 * m2 / FP.mold}px ${34 * m2 / FP.mold}px rgba(0,0,0,.18)` });
+  box(moldOak, px_ - m1 - m2, py_ - m1 - m2 + py, pw + 2 * (m1 + m2), ph + 2 * (m1 + m2));
+  const sweep = 360 * clamp(spring(t - b(39) - 0.05, 2.4, 1), 0, 1);
+  const cone = `conic-gradient(from 0deg, #000 ${sweep}deg, transparent ${sweep}deg)`;
+  css(moldOak, { WebkitMaskImage: cone, maskImage: cone });
+  show(mat, m1 > 0.5); show(molding, m2 > 0.3); show(moldOak, m2 > 0.3 && sweep > 0.5);
+}
+
+// ───────────────────────── order: one black shape keeps changing ─────────────────────────
+const ordClip = el('div', 'L', S.order);
+const shape = el('div', 'L clip', ordClip); css(shape, { background: INK });
+const ordLabels = ['Order print', 'Ordered', 'Printing', 'Shipping', 'Delivered'].map(s => text(shape, s, { fontSize: '36px', fontWeight: 600, color: PAPER, letterSpacing: '-0.01em' }));
+const check = sel('svg', { class: 'L', width: 60, height: 60, viewBox: '0 0 60 60' }, shape);
+const checkPath = sel('path', { d: 'M12 31l12 12 24-26', fill: 'none', stroke: PAPER, 'stroke-width': 7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', pathLength: 1 }, check);
+const progress = el('div', 'L', shape); css(progress, { background: PAPER, borderRadius: '3px' });
+const route = sel('svg', { class: 'L', width: 600, height: 60, viewBox: '0 0 600 60' }, shape);
+sel('path', { d: 'M0 44H600', stroke: 'rgba(242,238,230,.45)', 'stroke-width': 4, 'stroke-dasharray': '2 14', 'stroke-linecap': 'round' }, route);
+const van = sel('g', {}, route);
+sel('path', { d: 'M0 14h40v24H0Z M40 22h14l8 9v7H40Z', fill: PAPER }, van);
+sel('circle', { cx: 12, cy: 40, r: 6, fill: PAPER, stroke: INK, 'stroke-width': 3 }, van);
+sel('circle', { cx: 50, cy: 40, r: 6, fill: PAPER, stroke: INK, 'stroke-width': 3 }, van);
+const check2 = sel('svg', { class: 'L', width: 90, height: 90, viewBox: '0 0 60 60' }, shape);
+const check2Path = sel('path', { d: 'M12 31l12 12 24-26', fill: 'none', stroke: PAPER, 'stroke-width': 6, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', pathLength: 1 }, check2);
+const FLOOD_R = 1180;
+function shapeRect(t) {
+  return rectTrack(t, [[0, [CTA[0], CTA[1] - 90, CTA[2], CTA[3]]], [b(40) + 0.15, CTA, 3.4, 0.7],
+    [b(41), [420, 650, 600, 140], 3.0, 0.74], [b(42), [360, 650, 720, 140], 3.2, 0.74],
+    [b(43), [200, 660, 1040, 120], 3.0, 0.76], [b(44), [580, 580, 280, 280], 3.0, 0.72],
+    [b(45), [C - FLOOD_R, C - FLOOD_R, 2 * FLOOD_R, 2 * FLOOD_R], 3.3, 0.97]]);
+}
+function renderOrder(t) {
+  const on = t >= b(40) + 0.15 && t < b(45) + 0.36;
+  show(S.order, on);
+  if (!on) return;
+  const [x, y, w, h] = shapeRect(t);
+  // the button drops out from under the size row (a mask line), then the mask is let go
+  const dropping = t < b(41);
+  box(ordClip, CTA[0] - 20, CTA[1] - 10, CTA[2] + 40, 140, { overflow: dropping ? 'hidden' : 'visible' });
+  box(shape, x - (CTA[0] - 20), y - (CTA[1] - 10), w, h, { borderRadius: px(Math.min(w, h) / 2) });
+  // each label has its own mask (the shape) and rises in, then out
+  const times = [[b(40) + 0.15, b(41)], [b(41) + 0.06, b(42)], [b(42) + 0.06, b(43)], [b(43) + 0.06, b(44)], [b(44) + 0.08, b(45)]];
+  ordLabels.forEach((lab, i) => {
+    const [a, z] = times[i];
+    const lw = widthOf(lab);
+    let lx = (w - lw) / 2, ly = (h - 36) / 2;
+    if (i === 1) lx = (w - lw + 70) / 2;
+    if (i === 3) lx = 54;
+    if (i === 4) ly = h / 2 + 34;
+    lab.style.transform = `translate(${lx}px, ${ly + riseY(t, a, z, h)}px)`;
+    show(lab, t >= a - 0.01 && t < z + 0.4);
+  });
+  const lw1 = widthOf(ordLabels[1]);
+  css(check, { transform: `translate(${(w - lw1 - 70) / 2 - 8}px, ${(h - 60) / 2 + riseY(t, b(41) + 0.06, b(42), h)}px)` });
+  checkPath.setAttribute('stroke-dasharray', `${clamp(spring(t - b(41) - 0.12, 3, 1))} 1`);
+  show(check, t >= b(41) && t < b(42) + 0.4);
+  const pg = clamp(spring(t - b(42) - 0.08, 2.0, 1), 0, 1);
+  box(progress, 60, h - 30, (w - 120) * pg, 6);
+  show(progress, t >= b(42) + 0.08 && t < b(43));
+  css(route, { transform: `translate(${w - 640}px, ${(h - 60) / 2 + riseY(t, b(43) + 0.06, b(44), h)}px)` });
+  van.setAttribute('transform', `translate(${530 * clamp(spring(t - b(43) - 0.1, 1.6, 1), 0, 1)}, 0)`);
+  show(route, t >= b(43) && t < b(44) + 0.4);
+  css(check2, { transform: `translate(${(w - 90) / 2}px, ${h / 2 - 84 + riseY(t, b(44) + 0.08, b(45), h)}px)` });
+  check2Path.setAttribute('stroke-dasharray', `${clamp(spring(t - b(44) - 0.14, 3, 1))} 1`);
+  show(check2, t >= b(44) && t < b(45) + 0.4);
+}
+
+// ───────────────────────── wall: real footage, framed print, the same iris ─────────────────────────
+const wallCanvas = el('canvas', 'L', S.wall); wallCanvas.width = W; wallCanvas.height = W;
+const FR = { x: 448, y: 300, w: 544, h: 760, mold: 30, mat: 74 };
+FR.print = [FR.x + FR.mold + FR.mat, FR.y + FR.mold + FR.mat, FR.w - 2 * (FR.mold + FR.mat), FR.h - 2 * (FR.mold + FR.mat)];
+const frameEl = el('div', 'L', S.wall);
+const matEl = el('div', 'L', frameEl);
+const printBox = el('div', 'L clip', S.wall);
+const printImg = photo('sea', printBox);
+const iris2 = irisSvg(S.wall, 'printClip');
+const shadowCanvas = el('canvas', 'L', S.wall); shadowCanvas.width = FR.w; shadowCanvas.height = FR.h;
+css(shadowCanvas, { mixBlendMode: 'multiply' });
+const wallBlack = el('div', 'L', S.wall); css(wallBlack, { background: INK });
+let video = null;
+async function wallFrame(t) {
+  const target = clamp(1.5 + (t - b(45)), 0, (video.duration || 13) - 0.05);
+  if (Math.abs(video.currentTime - target) > 0.0005) {
+    await new Promise(res => { video.addEventListener('seeked', res, { once: true }); video.currentTime = target; });
+  }
+  wallCanvas.getContext('2d').drawImage(video, 0, 0, W, W);
+  // the leaf shadows fall on the frame too: the wall is normalised to white and multiplied on top
+  const s = shadowCanvas.getContext('2d');
+  s.filter = 'grayscale(1) brightness(1.22) contrast(1.35)';
+  s.clearRect(0, 0, FR.w, FR.h);
+  s.drawImage(video, FR.x / W * video.videoWidth, FR.y / W * video.videoHeight, FR.w / W * video.videoWidth, FR.h / W * video.videoHeight, 0, 0, FR.w, FR.h);
+  s.filter = 'none';
+}
+async function renderWall(t) {
+  const on = t >= b(45) + 0.28 && t < b(51) + 0.4;
+  show(S.wall, on);
+  if (!on) return;
+  await wallFrame(t);
+  box(wallCanvas, 0, 0, W, W);
+  box(frameEl, FR.x, FR.y, FR.w, FR.h, { background: OAK,
+    boxShadow: '0 2px 0 rgba(255,255,255,.25) inset, 0 -2px 0 rgba(0,0,0,.18) inset, 14px 22px 30px rgba(40,30,20,.28), 3px 5px 8px rgba(40,30,20,.25)' });
+  box(matEl, FR.mold, FR.mold, FR.w - 2 * FR.mold, FR.h - 2 * FR.mold, { background: '#F7F5F0', boxShadow: 'inset 2px 3px 6px rgba(0,0,0,.22)' });
+  const [px_, py_, pw, ph] = FR.print;
+  box(printBox, px_, py_, pw, ph);
+  css(printImg, { width: px(ph), height: px(ph), transform: `translate(${(pw - ph) / 2 - 40}px, 0px)` });
+  // black shrinks into the print (b46), the iris opens (b48) and closes (b50), then the black floods out (b51)
+  const k = clamp(spring(t - b(46) - 0.1, 2.6, 0.84), 0, 1.02);
+  const out = clamp(spring(t - b(51), 3.4, 0.97), 0, 1);
+  const big = [-80, -80, W + 160, W + 160];
+  const bx = lerp(lerp(0, px_, k), big[0], out), by = lerp(lerp(0, py_, k), big[1], out);
+  const bw = lerp(lerp(W, pw, k), big[2], out), bh = lerp(lerp(W, ph, k), big[3], out);
+  box(wallBlack, bx, by, bw, bh);
+  show(wallBlack, t < b(48) + 0.02 || t >= b(51));
+  const a = clamp(track(t, [[0, 0], [b(48), 1, 4.2, 0.6], [b(50), 0, 3.8, 0.85]]), 0, 1.02);
+  placeIris(iris2, px_, py_, pw, ph, a, false);
+  show(iris2.svg, t >= b(48) - 0.02);
+  box(shadowCanvas, FR.x, FR.y, FR.w, FR.h);
+}
+
+// ───────────────────────── cursor ─────────────────────────
+const cur = sel('svg', { class: 'L', width: 44, height: 56, viewBox: '-4 -4 44 56' }, S.cursor);
+const ring = sel('circle', { cx: 0, cy: 0, r: 30, fill: 'none', stroke: INK, 'stroke-width': 4, 'stroke-linecap': 'round', transform: 'rotate(-90)' }, cur);
+sel('path', { d: 'M0 0V30L7.4 23.2L12 34L17 31.8L12.6 21.4H22.4Z', fill: INK, stroke: '#fff', 'stroke-width': 2.4, 'stroke-linejoin': 'round' }, cur);
+const REST = [1120, 1170];
+let CK = null;
+function cursorKeys() {
+  const pr = FR.print;
+  return [
+    [0, REST], [0.08, [WM.dot[0] + 6, WM.dot[1] + 4], 2.2, 0.95],
+    [b(3) + 0.08, [1000, 900], 2.0, 1], [b(4) + 0.1, [C + 230, C + 30], 2.0, 1],
+    [b(6) - 0.05, [1060, 1030], 2.0, 1],
+    [b(11) + 0.2, DROP_W, 2.4, 1],
+    [b(13) + 0.01, [C, C], 6, 1],                                        // (the zoom ride overrides this)
+    [b(15) + 0.08, [1010, 980], 2.0, 1],
+    [b(19) - 0.35, [C - 75, BAR.y + BAR.h / 2], 2.6, 1],
+    [b(21) - 0.3, [BAR.x + SLIDE.x0, BAR.y + BAR.h / 2], 2.6, 1],
+    [b(21) + 0.05, KNOB, 1.5, 1],
+    [b(24), [C, 600], 6, 1],                                             // (the sphere drag overrides this)
+    [b(26) + 0.15, [1030, 1080], 1.8, 1],
+    [b(28) - 0.3, [C, 1296], 2.4, 1],
+    [b(29) - 0.05, [1090, 1040], 2.0, 1],
+    [b(30) - 0.25, [C + 6, PHONE[1] + 46], 2.4, 1],
+    [b(31) + 0.1, [760, 430], 2.0, 1],
+    [b(33) - 0.3, [760, 640], 2.4, 1],
+    [b(34) - 0.2, [C + 40, C + 70], 2.4, 1],
+    [b(34) + 0.24, [190, 75], 1.7, 1],
+    [b(36) + 0.05, [930, 1180], 1.8, 1],
+    [b(39) - 0.3, [SW_X + 82 + 32, SW_Y + 32], 2.4, 1],
+    [b(40) - 0.25, [chipX(1) + 73, CHIP_Y + 34], 2.6, 1],
+    [b(41) - 0.18, [CTA[0] + 270, CTA[1] + 52], 3.0, 1],
+    [b(41) + 0.15, [1110, 1130], 1.8, 1],
+    [b(47), [pr[0] + pr[2] * 0.56, pr[1] + pr[3] * 0.54], 2.2, 1],
+    [b(51) + 0.2, REST, 1.8, 1],
+  ];
+}
+function cursorAt(t) {
+  if (t >= b(13) && t < b(15)) return toScreen(camera(t), DROP_W);      // rides the droplet through the zoom
+  if (t >= b(23) && t < b(26)) { const s = sphereState(t); return [s.x, s.y]; }   // holds the lens
+  return track2(t, CK);
+}
+const CLICKS = [b(2), b(5), b(12), b(19), b(28), b(30), b(33), b(39), b(40), b(41), b(48), b(50)];
+const HOLDS = [[b(21) - 0.05, b(22) + 0.05], [b(23), b(26)], [b(34), b(36)]];
+const LONG = [b(23), b(34)];
+function renderCursor(t) {
+  show(S.cursor, true);
+  const [x, y] = cursorAt(t);
+  let press = 0;
+  for (const p of CLICKS) press += pulse(t, p - 0.05, 0.12);
+  for (const [a, z] of HOLDS) press += clamp(spring(t - a, 6, 0.8)) - clamp(spring(t - z, 6, 0.8));
+  const s = 1.22 * camera(t).Z * (1 - 0.14 * clamp(press));
+  cur.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
+  let lp = 0;
+  for (const a of LONG) if (t >= a && t < a + 0.45) lp = clamp((t - a) / 0.24);
+  const Lc = 2 * Math.PI * 30;
+  ring.setAttribute('stroke-dasharray', `${Lc * lp} ${Lc}`);
+  ring.setAttribute('opacity', lp > 0 ? 1 : 0);
+}
+
+// ───────────────────────── sound cues (placed by the mixer at each file's measured peak) ─────────────────────────
+const SFX = [
+  [b(2), 'click'], [b(3), 'pop'], [b(4), 'rise'], [b(5), 'click'], [b(5) + 0.05, 'shutter'], [b(6), 'shutter'],
+  [b(7), 'pop'], [b(9), 'paper'], [b(10), 'paper'], [b(11), 'slide'], [b(12), 'click'], [b(13), 'whoosh'],
+  ...[0, 1, 2, 3, 4].map(i => [b(15) + i * BEAT / 4, 'glass']), [b(17), 'liquid'], [b(18), 'pop'], [b(19), 'tap'],
+  [b(20), 'slide'], [b(21), 'tick'], [b(23), 'glassy'], [b(24), 'whoosh'], [b(25), 'bubble'], [b(26), 'swell'],
+  [b(27), 'tick'], [b(28), 'pop'], [b(29), 'suck'], [b(30), 'stretch'], [b(31), 'whoosh'], [b(33), 'blind'],
+  [b(34), 'lift'], [b(35), 'page'], [b(36), 'thunk'], [b(37), 'scroll'], [b(38), 'pop'], [b(38) + 0.12, 'pop'],
+  [b(39), 'click'], [b(40), 'click'], [b(40) + 0.15, 'slide'], [b(41), 'click'], [b(41) + 0.12, 'check'],
+  [b(42), 'printer'], [b(43), 'van'], [b(44), 'ding'], [b(45), 'boom'], [b(48), 'shutter'], [b(50), 'shutter'],
+  [b(51), 'whoosh'], [b(53), 'impact'],
+];
+
+// ───────────────────────── seek ─────────────────────────
+const LAYERS = ['world', 'lock', 'desk', 'web', 'win', 'card', 'wall', 'order', 'open', 'iris', 'glass', 'cursor'];
+async function seek(t) {
+  t = clamp(t, 0, DUR - 1e-6);
+  pending = [];
+  renderOpen(t);
+  renderIris(t);
+  const cam = renderWorld(t);
+  renderGlass(t, cam);
+  renderLock(t);
+  renderDesk(t);
+  renderWin(t);
+  renderCard(t);
+  renderWeb(t);
+  renderOrder(t);
+  await renderWall(t);
+  renderCursor(t);
+  LAYERS.forEach((k, i) => { S[k].style.zIndex = String(i + 1); });
+  if (t < b(5)) S.open.style.zIndex = '20';
+  else if (t < b(7)) { S.open.style.zIndex = '1'; S.world.style.zIndex = '2'; }
+  if (pending.length) await Promise.all(pending);
+  await twoFrames();
+}
+
+async function init() {
+  await Promise.all(['800 100px Archivo', '600 54px Geist', '500 19px Geist', '700 80px Geist'].map(f => document.fonts.load(f)));
+  await document.fonts.ready;
+  measure();
+  CIRCLE_MAP = rrectMap(1024, 1024, 512, 470);
+  LIGHT = glassLetters(S.glass, 'Light', 300, 'expanded', 92, 4);
+  for (const L of LIGHT) S.glass.insertBefore(L.wrap, bar.outer);
+  CLOCK = glassLetters(lockGroup, '18:24', 236, 'normal', 80, 2);
+  CK = cursorKeys();
+  await Promise.all(imgs.map(i => i.decode().catch(() => {})));
+  const blob = await (await fetch(WALL_SRC)).blob();   // blob URL: simple servers cannot range-seek video
+  video = document.createElement('video');
+  video.muted = true; video.playsInline = true; video.preload = 'auto';
+  video.src = URL.createObjectURL(blob);
+  await new Promise(res => { video.addEventListener('loadeddata', res, { once: true }); video.load(); });
+}
+
+window.seek = seek;
+window.DUR = DUR;
+window.SFX = SFX;
+window.ready = init().then(async () => {
+  const q = new URLSearchParams(location.search);
+  if (!q.has('render')) {
+    document.body.classList.add('preview');
+    const fit = () => document.body.style.setProperty('--fit', Math.min(innerWidth, innerHeight - 40) / W);
+    fit(); addEventListener('resize', fit);
+    const sc = document.getElementById('scrub');
+    let busy = false, want = null;
+    const go = async v => { want = v; if (busy) return; busy = true; while (want != null) { const x = want; want = null; await seek(x); } busy = false; };
+    sc.addEventListener('input', () => go(+sc.value));
+    sc.value = q.get('t') || 0;
+    await seek(+sc.value);
+  }
+  return true;
+});
+</script>
+</body>
+</html>
